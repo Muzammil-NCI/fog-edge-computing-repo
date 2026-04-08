@@ -1,0 +1,288 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Campus fog/edge V2 — Edge Lambda → SQS → Fog Lambda → IoT Core + DynamoDB; HTTP API for dashboard.
+
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 256
+    Runtime: python3.13
+    Architectures:
+      - x86_64
+
+Parameters:
+  IoTDataEndpoint:
+    Type: String
+    Default: a1453c1ykghwb8-ats.iot.us-east-1.amazonaws.com
+    Description: >
+      AWS IoT Core data-ATS hostname only (e.g. abcdefghijk-ats.iot.eu-west-1.amazonaws.com). No https://
+  IoTPublishTopic:
+    Type: String
+    Default: campus/v2/fog/aggregated
+    Description: MQTT topic fog Lambda publishes aggregates to.
+  EdgeScheduleMinutes:
+    Type: Number
+    Default: 1
+    Description: How often each edge simulator Lambda runs (four functions share the same schedule).
+  MessagesPerEdgeInvocation:
+    Type: Number
+    Default: 120
+    Description: >
+      SQS messages per edge run per sensor Lambda. Four Lambdas run on the same schedule, so total ingress ≈ 4× this count per tick (same metric per function).
+  EdgeSendIntervalSeconds:
+    Type: Number
+    Default: 0.5
+    Description: >
+      Sleep between SQS sends (seconds) within one edge invocation. Each Lambda sends only one metric type; zone still round-robins across DEFAULT_CAMPUS_ZONES.
+  FogWindowSeconds:
+    Type: Number
+    Default: 5
+    Description: Fog aggregation window (wall clock); lower = fresher dashboard points.
+  ExistingRoleArn:
+    Default: arn:aws:iam::472961221505:role/LabRole
+    Type: String
+
+Resources:
+  TelemetryDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      # Role: !Ref ExistingRoleArn
+
+  TelemetryQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 120
+      # Role: !Ref ExistingRoleArn
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TelemetryDLQ.Arn
+        maxReceiveCount: 5
+
+  FogStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      # Role: !Ref ExistingRoleArn
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  AggregatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      # Role: !Ref ExistingRoleArn
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      # Role: !Ref ExistingRoleArn
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - "*"
+        AllowOrigins:
+          - "*"
+
+  # Four edge Lambdas (one sensor type each) share the same queue; fog/API unchanged.
+  EdgeTemperatureFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/
+      Handler: edge_app.handler
+      Timeout: 120
+      Description: Edge simulator — temperature only → SQS
+      Role: !Ref ExistingRoleArn
+      Environment:
+        Variables:
+          TELEMETRY_QUEUE_URL: !Ref TelemetryQueue
+          EDGE_SENSOR_METRIC: temperature
+          MESSAGES_PER_INVOCATION: !Sub "${MessagesPerEdgeInvocation}"
+          EDGE_SEND_INTERVAL_SECONDS: !Sub "${EdgeSendIntervalSeconds}"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt TelemetryQueue.Arn
+      Events:
+        ScheduleTick:
+          Type: Schedule
+          Properties:
+            Schedule: !Sub rate(${EdgeScheduleMinutes} minute)
+            Enabled: true
+
+  EdgeHumidityFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/
+      Handler: edge_app.handler
+      Timeout: 120
+      Description: Edge simulator — humidity only → SQS
+      Role: !Ref ExistingRoleArn
+      Environment:
+        Variables:
+          TELEMETRY_QUEUE_URL: !Ref TelemetryQueue
+          EDGE_SENSOR_METRIC: humidity
+          MESSAGES_PER_INVOCATION: !Sub "${MessagesPerEdgeInvocation}"
+          EDGE_SEND_INTERVAL_SECONDS: !Sub "${EdgeSendIntervalSeconds}"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt TelemetryQueue.Arn
+      Events:
+        ScheduleTick:
+          Type: Schedule
+          Properties:
+            Schedule: !Sub rate(${EdgeScheduleMinutes} minute)
+            Enabled: true
+
+  EdgeCo2Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/
+      Handler: edge_app.handler
+      Timeout: 120
+      Description: Edge simulator — CO2 only → SQS
+      Role: !Ref ExistingRoleArn
+      Environment:
+        Variables:
+          TELEMETRY_QUEUE_URL: !Ref TelemetryQueue
+          EDGE_SENSOR_METRIC: co2
+          MESSAGES_PER_INVOCATION: !Sub "${MessagesPerEdgeInvocation}"
+          EDGE_SEND_INTERVAL_SECONDS: !Sub "${EdgeSendIntervalSeconds}"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt TelemetryQueue.Arn
+      Events:
+        ScheduleTick:
+          Type: Schedule
+          Properties:
+            Schedule: !Sub rate(${EdgeScheduleMinutes} minute)
+            Enabled: true
+
+  EdgeLightFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/
+      Handler: edge_app.handler
+      Timeout: 120
+      Description: Edge simulator — light only → SQS
+      Role: !Ref ExistingRoleArn
+      Environment:
+        Variables:
+          TELEMETRY_QUEUE_URL: !Ref TelemetryQueue
+          EDGE_SENSOR_METRIC: light
+          MESSAGES_PER_INVOCATION: !Sub "${MessagesPerEdgeInvocation}"
+          EDGE_SEND_INTERVAL_SECONDS: !Sub "${EdgeSendIntervalSeconds}"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !GetAtt TelemetryQueue.Arn
+      Events:
+        ScheduleTick:
+          Type: Schedule
+          Properties:
+            Schedule: !Sub rate(${EdgeScheduleMinutes} minute)
+            Enabled: true
+
+  FogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/
+      Handler: fog_app.handler
+      Description: Fog processing — SQS → filter/smooth/window → IoT + DynamoDB
+      Role: !Ref ExistingRoleArn
+      Environment:
+        Variables:
+          FOG_STATE_TABLE: !Ref FogStateTable
+          AGGREGATES_TABLE: !Ref AggregatesTable
+          IOT_DATA_ENDPOINT: !Ref IoTDataEndpoint
+          IOT_TOPIC: !Ref IoTPublishTopic
+          WINDOW_SECONDS: !Sub "${FogWindowSeconds}"
+          WINDOW_MAX_SAMPLES: "40"
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt FogStateTable.Arn
+                - !GetAtt AggregatesTable.Arn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - iot:Publish
+              Resource: !Sub arn:${AWS::Partition}:iot:${AWS::Region}:${AWS::AccountId}:topic/${IoTPublishTopic}
+      Events:
+        FromQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TelemetryQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 2
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/
+      Handler: api_app.handler
+      Description: REST API for dashboard — query aggregates
+      Role: !Ref ExistingRoleArn
+      Environment:
+        Variables:
+          AGGREGATES_TABLE: !Ref AggregatesTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AggregatesTable
+      Events:
+        GetReadings:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /readings
+            Method: GET
+
+Outputs:
+  TelemetryQueueUrl:
+    Description: SQS queue URL (edge → fog)
+    Value: !Ref TelemetryQueue
+  FogStateTableName:
+    Value: !Ref FogStateTable
+  AggregatesTableName:
+    Value: !Ref AggregatesTable
+  HttpApiUrl:
+    Description: Base URL for API Gateway (append /readings)
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  DashboardFetchExample:
+    Description: Example GET URL for the static dashboard
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/readings?zone=S1.02&metric=temperature&limit=30
